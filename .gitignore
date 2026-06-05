@@ -1,0 +1,18 @@
+# PDF data directories — not part of source control
+old/
+new/
+
+# Build output
+**/bin/
+**/obj/
+
+# User-specific IDE files
+.vs/
+*.user
+
+# NuGet
+*.nupkg
+
+# OS
+.DS_Store
+Thumbs.db
