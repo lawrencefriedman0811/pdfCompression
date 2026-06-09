@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using iText.IO.Source;
 using iText.Kernel.Pdf;
 using PdfCompress.Core.Models;
 
@@ -28,12 +29,26 @@ public static class PdfOptimizer
                 readerProps.SetPassword(Encoding.UTF8.GetBytes(password));
 
             using var reader = new PdfReader(inputPath, readerProps);
-            using var writer = new PdfWriter(outputPath, new WriterProperties()
-                .SetCompressionLevel(CompressionConstants.BEST_COMPRESSION)
-                .SetFullCompressionMode(true));
-            using var doc = new PdfDocument(reader, writer);
+            using var srcDoc = new PdfDocument(reader);
 
-            OptimizeDocument(doc);
+            // Mutate the source model in memory: prune dead /XObject references and
+            // collapse duplicate Form XObjects.
+            OptimizeDocument(srcDoc);
+
+            // iText never garbage-collects orphaned indirect objects, so removing the
+            // last reference to a form is not enough — the bytes stay in the file.
+            // Re-emit by copying the pages into a fresh document: the copy walks the
+            // object graph from each page and only carries over still-referenced
+            // objects, leaving the now-unreachable forms behind. Smart mode reuses
+            // structurally identical objects across pages.
+            var writerProps = new WriterProperties()
+                .SetCompressionLevel(CompressionConstants.BEST_COMPRESSION)
+                .SetFullCompressionMode(true);
+            using var writer = new PdfWriter(outputPath, writerProps);
+            writer.SetSmartMode(true);
+            using var destDoc = new PdfDocument(writer);
+
+            srcDoc.CopyPagesTo(1, srcDoc.GetNumberOfPages(), destDoc);
         }
         catch (Exception ex)
         {
@@ -48,6 +63,14 @@ public static class PdfOptimizer
 
     private static void OptimizeDocument(PdfDocument doc)
     {
+        // Pass 0 — drop per-page /XObject resource entries that the page (and the
+        // forms it actually draws) never invoke with a `Do` operator. EVO-generated
+        // PDFs attach thousands of Form XObjects to every page's resource dictionary
+        // while drawing only a handful; removing the dead name→ref entries makes the
+        // orphaned forms unreachable so the copy in Optimize() leaves them behind.
+        // Lossless.
+        PruneUnusedXObjectReferences(doc);
+
         // Pass 1 — build a global hash → canonical-stream map across all pages.
         // Empty Form XObjects all map to a single shared "canonical empty".
         PdfStream? canonicalEmpty = null;
@@ -119,6 +142,212 @@ public static class PdfOptimizer
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Removes name→XObject entries from page (and nested form) /XObject resource
+    /// dictionaries that are never invoked with a `Do` operator in any content stream
+    /// that can resolve names through them. Uses an accumulate-then-prune strategy
+    /// keyed by dictionary identity so that shared/inherited resource dictionaries are
+    /// pruned once, using the union of names invoked across every scope that references
+    /// them. Page content, annotation appearance streams, and the Form XObjects those
+    /// scopes draw are all analyzed (including forms that omit /Resources and therefore
+    /// inherit the caller's resources). Any scope whose usage cannot be determined
+    /// safely marks its /XObject dictionary "unsafe", leaving it completely untouched.
+    /// </summary>
+    private static void PruneUnusedXObjectReferences(PdfDocument doc)
+    {
+        var ctx = new PruneContext();
+
+        for (int i = 1; i <= doc.GetNumberOfPages(); i++)
+        {
+            var page = doc.GetPage(i);
+            var pageResources = page.GetResources()?.GetPdfObject();
+            var pageXObjects = GetXObjectDict(page);
+
+            ProcessScope(TryGetPageContent(page), pageResources, pageXObjects, ctx);
+
+            // Annotation appearance streams draw from their own /Resources, or — if
+            // absent — inherit the page's. Treat each as an additional content scope.
+            foreach (var stream in CollectAppearanceStreams(page))
+                ProcessForm(stream, pageXObjects, ctx);
+        }
+
+        foreach (var (dict, used) in ctx.UsedNames)
+        {
+            if (ctx.UnsafeDicts.Contains(dict)) continue;
+
+            var keysToRemove = dict.KeySet()
+                .Where(k => !used.Contains(k.GetValue()))
+                .ToList();
+
+            foreach (var key in keysToRemove)
+                dict.Remove(key);
+        }
+    }
+
+    private sealed class PruneContext
+    {
+        public Dictionary<PdfDictionary, HashSet<string>> UsedNames { get; } = new();
+        public HashSet<PdfDictionary> UnsafeDicts { get; } = new();
+        public HashSet<(PdfStream Form, object Context)> VisitedForms { get; } = new();
+    }
+
+    /// <summary>
+    /// Analyzes one content scope. <paramref name="resources"/> is the resource
+    /// dictionary that owns the content (may be null when a form inherits its caller's
+    /// resources, in which case <paramref name="inheritedXObjects"/> is used).
+    /// </summary>
+    private static void ProcessScope(
+        byte[]? content,
+        PdfDictionary? resources,
+        PdfDictionary? inheritedXObjects,
+        PruneContext ctx)
+    {
+        // Effective /XObject dictionary for resolving names in this content: a form
+        // with its own /Resources never falls back to the caller, so only inherit
+        // when /Resources is entirely absent.
+        var xObjects = resources is null
+            ? inheritedXObjects
+            : resources.GetAsDictionary(PdfName.XObject);
+
+        if (xObjects is null) return;
+
+        if (!ctx.UsedNames.ContainsKey(xObjects))
+            ctx.UsedNames[xObjects] = new HashSet<string>(StringComparer.Ordinal);
+        var set = ctx.UsedNames[xObjects];
+
+        // A Type 3 font's glyph procedures can draw XObjects through these same
+        // resources (inheriting them when the font omits /Resources). We do not
+        // analyze CharProcs, so never prune a dictionary reachable from one.
+        if (content is null || (resources is not null && HasType3Font(resources)))
+        {
+            ctx.UnsafeDicts.Add(xObjects);
+            return;
+        }
+
+        HashSet<string> namesInScope;
+        try
+        {
+            namesInScope = ExtractDoNames(content);
+        }
+        catch
+        {
+            // Unparseable content (e.g. inline images) → never prune the dict.
+            ctx.UnsafeDicts.Add(xObjects);
+            return;
+        }
+
+        set.UnionWith(namesInScope);
+
+        // Recurse into the Form XObjects this scope actually draws.
+        foreach (var name in namesInScope)
+        {
+            var stream = xObjects.GetAsStream(new PdfName(name));
+            if (stream is null || stream.GetAsName(PdfName.Subtype) != PdfName.Form)
+                continue;
+
+            ProcessForm(stream, xObjects, ctx);
+        }
+    }
+
+    private static void ProcessForm(
+        PdfStream formStream, PdfDictionary? callerXObjects, PruneContext ctx)
+    {
+        var resources = formStream.GetAsDictionary(PdfName.Resources);
+
+        // Resolution context: the form's own resources, or the caller's when it
+        // inherits. Visit each (form, context) pair once — the same form drawn from
+        // two different inherited contexts must contribute to both.
+        object context = resources ?? (object?)callerXObjects ?? formStream;
+        if (!ctx.VisitedForms.Add((formStream, context)))
+            return;
+
+        ProcessScope(TryGetBytes(formStream), resources, callerXObjects, ctx);
+    }
+
+    private static bool HasType3Font(PdfDictionary resources)
+    {
+        var fonts = resources.GetAsDictionary(PdfName.Font);
+        if (fonts is null) return false;
+
+        foreach (var value in fonts.Values())
+        {
+            var font = value is PdfIndirectReference r
+                ? r.GetRefersTo() as PdfDictionary
+                : value as PdfDictionary;
+            if (font?.GetAsName(PdfName.Subtype) == PdfName.Type3)
+                return true;
+        }
+
+        return false;
+    }
+
+    private static IEnumerable<PdfStream> CollectAppearanceStreams(PdfPage page)
+    {
+        foreach (var annot in page.GetAnnotations())
+        {
+            var ap = annot.GetPdfObject().GetAsDictionary(PdfName.AP);
+            if (ap is null) continue;
+
+            foreach (var value in ap.Values())
+            {
+                var resolved = value is PdfIndirectReference r ? r.GetRefersTo() : value;
+                if (resolved is PdfStream stream)
+                {
+                    yield return stream;
+                }
+                else if (resolved is PdfDictionary states)
+                {
+                    // Appearance sub-dictionary keyed by annotation state.
+                    foreach (var inner in states.Values())
+                    {
+                        if (ResolveStream(inner) is { } innerStream)
+                            yield return innerStream;
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Tokenizes a content stream and returns the set of names invoked as
+    /// `/Name Do`. Throws if an inline image (`BI`) is encountered, since the raw
+    /// image bytes desync the tokenizer and could hide a real `Do` invocation.
+    /// </summary>
+    private static HashSet<string> ExtractDoNames(byte[] content)
+    {
+        var used = new HashSet<string>(StringComparer.Ordinal);
+        var tokenizer = new PdfTokenizer(
+            new RandomAccessFileOrArray(
+                new RandomAccessSourceFactory().CreateSource(content)));
+
+        string? lastName = null;
+        while (tokenizer.NextToken())
+        {
+            var type = tokenizer.GetTokenType();
+            if (type == PdfTokenizer.TokenType.Name)
+            {
+                lastName = tokenizer.GetStringValue();
+            }
+            else if (type == PdfTokenizer.TokenType.Other)
+            {
+                var op = tokenizer.GetStringValue();
+                if ("Do".Equals(op, StringComparison.Ordinal) && lastName is not null)
+                    used.Add(lastName);
+                else if ("BI".Equals(op, StringComparison.Ordinal))
+                    throw new InvalidOperationException("Inline image; cannot prune safely.");
+                lastName = null;
+            }
+        }
+
+        return used;
+    }
+
+    private static byte[]? TryGetPageContent(PdfPage page)
+    {
+        try { return page.GetContentBytes(); }
+        catch { return null; }
+    }
 
     private static IEnumerable<PdfStream> CollectFormXObjects(PdfPage page)
     {
