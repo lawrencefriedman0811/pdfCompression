@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Runtime.CompilerServices;
 using System.Text;
 using iText.IO.Source;
 using iText.Kernel.Pdf;
@@ -44,6 +45,7 @@ public static class PdfOptimizer
             var writerProps = new WriterProperties()
                 .SetCompressionLevel(CompressionConstants.BEST_COMPRESSION)
                 .SetFullCompressionMode(true);
+            ApplyEncryption(writerProps, password);
             using var writer = new PdfWriter(outputPath, writerProps);
             writer.SetSmartMode(true);
             using var destDoc = new PdfDocument(writer);
@@ -59,6 +61,35 @@ public static class PdfOptimizer
         var compressedSize = new FileInfo(outputPath).Length;
         return new CompressionResult(
             Path.GetFileName(inputPath), originalSize, compressedSize);
+    }
+
+    public static CompressionResult ApplyPasswordOnly(
+        string inputPath, string outputPath, string? password = null)
+    {
+        var originalSize = new FileInfo(inputPath).Length;
+
+        try
+        {
+            var readerProps = new ReaderProperties();
+            if (password is not null)
+                readerProps.SetPassword(Encoding.UTF8.GetBytes(password));
+
+            var writerProps = new WriterProperties();
+            ApplyEncryption(writerProps, password);
+
+            using var reader = new PdfReader(inputPath, readerProps);
+            using var writer = new PdfWriter(outputPath, writerProps);
+            using var doc = new PdfDocument(reader, writer);
+        }
+        catch (Exception ex)
+        {
+            return new CompressionResult(
+                Path.GetFileName(inputPath), originalSize, 0, ex.Message);
+        }
+
+        var rewrittenSize = new FileInfo(outputPath).Length;
+        return new CompressionResult(
+            Path.GetFileName(inputPath), originalSize, rewrittenSize);
     }
 
     private static void OptimizeDocument(PdfDocument doc)
@@ -139,6 +170,11 @@ public static class PdfOptimizer
                 }
             }
         }
+
+        // Pass 3 — remove unused /Font resource entries after Form XObject pruning
+        // and canonicalization. The final copy then leaves orphaned font dictionaries,
+        // descriptors, and embedded font-file streams behind.
+        PruneUnusedFontReferences(doc);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -315,8 +351,213 @@ public static class PdfOptimizer
     /// image bytes desync the tokenizer and could hide a real `Do` invocation.
     /// </summary>
     private static HashSet<string> ExtractDoNames(byte[] content)
+        => ExtractResourceNames(content).XObjectNames;
+
+    /// <summary>
+    /// Removes name→Font entries from page (and nested form) /Font resource
+    /// dictionaries when those names are never selected by a `Tf` operator in any
+    /// content stream that can resolve names through them. Unparseable scopes and
+    /// Type 3 font scopes are left untouched.
+    /// </summary>
+    private static void PruneUnusedFontReferences(PdfDocument doc)
     {
-        var used = new HashSet<string>(StringComparer.Ordinal);
+        var ctx = new FontPruneContext();
+        MarkAcroFormDefaultFontsUnsafe(doc, ctx);
+
+        for (int i = 1; i <= doc.GetNumberOfPages(); i++)
+        {
+            var page = doc.GetPage(i);
+            var pageResources = page.GetResources()?.GetPdfObject();
+            var pageContextKey = pageResources is null ? null : ObjectKey(pageResources);
+            var pageFonts = pageResources?.GetAsDictionary(PdfName.Font);
+            var pageXObjects = pageResources?.GetAsDictionary(PdfName.XObject);
+
+            ProcessFontScope(
+                TryGetPageContent(page),
+                pageResources,
+                inheritedFonts: null,
+                inheritedXObjects: null,
+                inheritedResourceContextKey: pageContextKey,
+                ctx);
+
+            foreach (var stream in CollectAppearanceStreams(page))
+            {
+                ProcessFontForm(
+                    stream,
+                    pageFonts,
+                    pageXObjects,
+                    pageContextKey,
+                    ctx);
+            }
+        }
+
+        foreach (var usage in ctx.FontDictionaries.Values)
+        {
+            if (usage.Unsafe) continue;
+
+            var keysToRemove = usage.Dictionary.KeySet()
+                .Where(k => !usage.UsedNames.Contains(k.GetValue()))
+                .ToList();
+
+            foreach (var key in keysToRemove)
+                usage.Dictionary.Remove(key);
+        }
+    }
+
+    private sealed class FontPruneContext
+    {
+        public Dictionary<string, FontDictionaryUsage> FontDictionaries { get; } =
+            new(StringComparer.Ordinal);
+        public HashSet<string> VisitedForms { get; } = new(StringComparer.Ordinal);
+    }
+
+    private sealed class FontDictionaryUsage(PdfDictionary dictionary)
+    {
+        public PdfDictionary Dictionary { get; } = dictionary;
+        public HashSet<string> UsedNames { get; } = new(StringComparer.Ordinal);
+        public bool Unsafe { get; set; }
+    }
+
+    private static void ProcessFontScope(
+        byte[]? content,
+        PdfDictionary? resources,
+        PdfDictionary? inheritedFonts,
+        PdfDictionary? inheritedXObjects,
+        string? inheritedResourceContextKey,
+        FontPruneContext ctx)
+    {
+        var fonts = resources is null
+            ? inheritedFonts
+            : resources.GetAsDictionary(PdfName.Font);
+        var xObjects = resources is null
+            ? inheritedXObjects
+            : resources.GetAsDictionary(PdfName.XObject);
+        var resourceContextKey = resources is null
+            ? inheritedResourceContextKey
+            : ObjectKey(resources);
+
+        var fontUsage = GetFontUsage(fonts, ctx);
+        if (fonts is null && xObjects is null)
+            return;
+
+        if (content is null)
+        {
+            if (fontUsage is not null)
+                fontUsage.Unsafe = true;
+            return;
+        }
+
+        if (fonts is not null && HasType3FontDictionary(fonts) && fontUsage is not null)
+            fontUsage.Unsafe = true;
+
+        ContentResourceNames namesInScope;
+        try
+        {
+            namesInScope = ExtractResourceNames(content);
+        }
+        catch
+        {
+            if (fontUsage is not null)
+                fontUsage.Unsafe = true;
+            return;
+        }
+
+        if (fontUsage is not null)
+            fontUsage.UsedNames.UnionWith(namesInScope.FontNames);
+
+        if (xObjects is null)
+            return;
+
+        foreach (var name in namesInScope.XObjectNames)
+        {
+            var stream = xObjects.GetAsStream(new PdfName(name));
+            if (stream is null || stream.GetAsName(PdfName.Subtype) != PdfName.Form)
+                continue;
+
+            ProcessFontForm(stream, fonts, xObjects, resourceContextKey, ctx);
+        }
+    }
+
+    private static void ProcessFontForm(
+        PdfStream formStream,
+        PdfDictionary? callerFonts,
+        PdfDictionary? callerXObjects,
+        string? callerResourceContextKey,
+        FontPruneContext ctx)
+    {
+        var resources = formStream.GetAsDictionary(PdfName.Resources);
+        var resourceContextKey = resources is null
+            ? callerResourceContextKey
+            : ObjectKey(resources);
+        var visitKey = $"{ObjectKey(formStream)}|{resourceContextKey ?? "none"}";
+
+        if (!ctx.VisitedForms.Add(visitKey))
+            return;
+
+        ProcessFontScope(
+            TryGetBytes(formStream),
+            resources,
+            resources is null ? callerFonts : null,
+            resources is null ? callerXObjects : null,
+            resourceContextKey,
+            ctx);
+    }
+
+    private static FontDictionaryUsage? GetFontUsage(
+        PdfDictionary? fonts,
+        FontPruneContext ctx)
+    {
+        if (fonts is null)
+            return null;
+
+        var key = ObjectKey(fonts);
+        if (!ctx.FontDictionaries.TryGetValue(key, out var usage))
+        {
+            usage = new FontDictionaryUsage(fonts);
+            ctx.FontDictionaries.Add(key, usage);
+        }
+
+        return usage;
+    }
+
+    private static void MarkAcroFormDefaultFontsUnsafe(
+        PdfDocument doc,
+        FontPruneContext ctx)
+    {
+        var acroForm = doc.GetCatalog()
+            .GetPdfObject()
+            .GetAsDictionary(PdfName.AcroForm);
+        var defaultResources = acroForm?.GetAsDictionary(new PdfName("DR"));
+        var defaultFonts = defaultResources?.GetAsDictionary(PdfName.Font);
+        var usage = GetFontUsage(defaultFonts, ctx);
+
+        if (usage is not null)
+            usage.Unsafe = true;
+    }
+
+    private static bool HasType3FontDictionary(PdfDictionary fonts)
+    {
+        foreach (var value in fonts.Values())
+        {
+            var font = value is PdfIndirectReference r
+                ? r.GetRefersTo() as PdfDictionary
+                : value as PdfDictionary;
+            if (font?.GetAsName(PdfName.Subtype) == PdfName.Type3)
+                return true;
+        }
+
+        return false;
+    }
+
+    private sealed class ContentResourceNames
+    {
+        public HashSet<string> XObjectNames { get; } = new(StringComparer.Ordinal);
+        public HashSet<string> FontNames { get; } = new(StringComparer.Ordinal);
+    }
+
+    private static ContentResourceNames ExtractResourceNames(byte[] content)
+    {
+        var used = new ContentResourceNames();
         var tokenizer = new PdfTokenizer(
             new RandomAccessFileOrArray(
                 new RandomAccessSourceFactory().CreateSource(content)));
@@ -333,7 +574,9 @@ public static class PdfOptimizer
             {
                 var op = tokenizer.GetStringValue();
                 if ("Do".Equals(op, StringComparison.Ordinal) && lastName is not null)
-                    used.Add(lastName);
+                    used.XObjectNames.Add(lastName);
+                else if ("Tf".Equals(op, StringComparison.Ordinal) && lastName is not null)
+                    used.FontNames.Add(lastName);
                 else if ("BI".Equals(op, StringComparison.Ordinal))
                     throw new InvalidOperationException("Inline image; cannot prune safely.");
                 lastName = null;
@@ -341,6 +584,14 @@ public static class PdfOptimizer
         }
 
         return used;
+    }
+
+    private static string ObjectKey(PdfObject obj)
+    {
+        var reference = obj.GetIndirectReference();
+        return reference is null
+            ? $"direct:{RuntimeHelpers.GetHashCode(obj)}"
+            : $"{reference.GetObjNumber()}:{reference.GetGenNumber()}";
     }
 
     private static byte[]? TryGetPageContent(PdfPage page)
@@ -416,5 +667,28 @@ public static class PdfOptimizer
         if (ra is null || rb is null) return ReferenceEquals(a, b);
         return ra.GetObjNumber() == rb.GetObjNumber() &&
                ra.GetGenNumber() == rb.GetGenNumber();
+    }
+
+    private static void ApplyEncryption(WriterProperties writerProps, string? password)
+    {
+        if (string.IsNullOrEmpty(password))
+            return;
+
+        var passwordBytes = Encoding.UTF8.GetBytes(password);
+        var permissions =
+            EncryptionConstants.ALLOW_PRINTING |
+            EncryptionConstants.ALLOW_MODIFY_CONTENTS |
+            EncryptionConstants.ALLOW_COPY |
+            EncryptionConstants.ALLOW_MODIFY_ANNOTATIONS |
+            EncryptionConstants.ALLOW_FILL_IN |
+            EncryptionConstants.ALLOW_SCREENREADERS |
+            EncryptionConstants.ALLOW_ASSEMBLY |
+            EncryptionConstants.ALLOW_DEGRADED_PRINTING;
+
+        writerProps.SetStandardEncryption(
+            userPassword: passwordBytes,
+            ownerPassword: passwordBytes,
+            permissions: permissions,
+            encryptionAlgorithm: EncryptionConstants.ENCRYPTION_AES_256);
     }
 }

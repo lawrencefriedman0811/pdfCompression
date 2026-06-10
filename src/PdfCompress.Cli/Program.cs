@@ -37,12 +37,16 @@ var overwriteOpt = new Option<bool>(
     "--overwrite",
     "Allow output directory to be the same as input (overwrites originals)");
 
-var root = new RootCommand("Compress PDF files by removing and deduplicating Form XObjects.")
+var passwordOnlyOpt = new Option<bool>(
+    "--password-only",
+    "Apply passwords from --passwords without running compression optimization");
+
+var root = new RootCommand("Compress PDF files by pruning unused resources and deduplicating Form XObjects.")
 {
-    inputOpt, outputOpt, passwordsOpt, limitOpt, parallelismOpt, formatOpt, overwriteOpt
+    inputOpt, outputOpt, passwordsOpt, limitOpt, parallelismOpt, formatOpt, overwriteOpt, passwordOnlyOpt
 };
 
-root.SetHandler(async (input, output, passwordFile, limit, parallelism, format, overwrite) =>
+root.SetHandler(async (input, output, passwordFile, limit, parallelism, format, overwrite, passwordOnly) =>
 {
     if (!input.Exists)
     {
@@ -58,6 +62,12 @@ root.SetHandler(async (input, output, passwordFile, limit, parallelism, format, 
     {
         Console.Error.WriteLine(
             "Output directory is the same as input. Use --overwrite to allow this.");
+        Environment.Exit(1);
+    }
+
+    if (passwordOnly && passwordFile is null)
+    {
+        Console.Error.WriteLine("--password-only requires --passwords <file.xlsx>.");
         Environment.Exit(1);
     }
 
@@ -101,7 +111,9 @@ root.SetHandler(async (input, output, passwordFile, limit, parallelism, format, 
         var outputPath = Path.Combine(output.FullName, pdf.Name);
 
         var result = await Task.Run(
-            () => PdfOptimizer.Optimize(pdf.FullName, outputPath, password), ct);
+            () => passwordOnly
+                ? PdfOptimizer.ApplyPasswordOnly(pdf.FullName, outputPath, password)
+                : PdfOptimizer.Optimize(pdf.FullName, outputPath, password), ct);
 
         results.Add(result);
     });
@@ -118,7 +130,7 @@ root.SetHandler(async (input, output, passwordFile, limit, parallelism, format, 
         Environment.Exit(1);
 
 },
-inputOpt, outputOpt, passwordsOpt, limitOpt, parallelismOpt, formatOpt, overwriteOpt);
+inputOpt, outputOpt, passwordsOpt, limitOpt, parallelismOpt, formatOpt, overwriteOpt, passwordOnlyOpt);
 
 return await root.InvokeAsync(args);
 

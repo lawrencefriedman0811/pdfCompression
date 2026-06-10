@@ -1,14 +1,16 @@
 # PdfCompress
 
-A .NET 8 command-line tool that reduces PDF file sizes by removing and deduplicating redundant **Form XObjects** — the most common source of bloat in PDFs exported from form-heavy systems (e.g. Kofax, DocuWare, SAP).
+A .NET 8 command-line tool that reduces PDF file sizes by pruning unused PDF resources and deduplicating redundant **Form XObjects** — common sources of bloat in PDFs exported from form-heavy systems (e.g. Kofax, DocuWare, SAP).
 
 ## How it works
 
-PDFs from form-processing systems often contain hundreds of identical or empty invisible Form XObjects embedded across every page. This tool performs two passes over each PDF:
+PDFs from form-processing systems often contain hundreds of identical or empty invisible Form XObjects embedded across every page, plus unused font resources that keep large embedded font programs reachable. This tool performs three optimization passes over each PDF:
 
 1. **Pass 1 — Collect** — Scans every page and decodes each Form XObject's stream. Empty forms (`q Q /Tx BMC EMC`) are flagged. Non-empty forms are fingerprinted using SHA-256 of their decoded bytes **plus** their semantic dictionary entries (`/BBox`, `/Matrix`, `/Resources`, `/Group`, etc.) to ensure visually different XObjects are never collapsed.
 
 2. **Pass 2 — Rewrite** — Replaces all references to empty forms with a single shared canonical empty, and replaces duplicate forms with a reference to the first occurrence. Content stream references remain valid — nothing is deleted.
+
+3. **Pass 3 — Font resource pruning** — Tokenizes page, form, and annotation appearance content streams to find the font resource names actually selected with `Tf`. Unused `/Font` resource entries are removed so unreachable font dictionaries, descriptors, and embedded font-file streams are left out of the rewritten output. Unsafe scopes, such as unparseable content or Type 3 font resources, are left untouched.
 
 The output is saved with maximum stream compression and full object-stream compression (iText 7's `BEST_COMPRESSION` + `SetFullCompressionMode`).
 
@@ -47,6 +49,7 @@ dotnet run --project src/PdfCompress.Cli -- --input <dir> --output <dir> [option
 | `--limit <n>` | | Process only the first N files (useful for testing) |
 | `--format text\|json` | | Output format — `text` table (default) or `json` |
 | `--overwrite` | | Allow `--output` to be the same directory as `--input` |
+| `--password-only` | | Apply passwords from `--passwords` without running compression optimization |
 
 ### Examples
 
@@ -57,19 +60,25 @@ dotnet run --project src/PdfCompress.Cli -- --input old --output new
 # With passwords, 4 parallel workers, JSON output
 dotnet run --project src/PdfCompress.Cli -- --input old --output new --passwords passwords.xlsx --parallelism 4 --format json
 
+# Password-only pass (same Excel mapping; no compression optimization)
+dotnet run --project src/PdfCompress.Cli -- --input old --output new --passwords passwords.xlsx --password-only
+
 # Test on 3 files first
 dotnet run --project src/PdfCompress.Cli -- --input old --output new --limit 3
 ```
 
 ### Password file format
 
-Create an Excel file (`.xlsx`) with these two columns — the header names are required:
+Create an Excel file (`.xlsx`) with filename and password columns. The standard headers are:
 
 | FileName | Password |
 |----------|----------|
 | Invoice_001.pdf | secret123 |
 | Invoice_002 | abc456 |
 
+- Existing partner-list workbooks are also supported with these headers:
+  - `Custom File Name (No Special Characters)`
+  - `Password (Optional)`
 - The `.pdf` extension is optional in the `FileName` column.
 - Matching is case-insensitive.
 - If a PDF has no entry in the file, it is opened without a password. If that fails, the file is logged as an error and the batch continues.
