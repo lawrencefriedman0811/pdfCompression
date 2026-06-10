@@ -19,15 +19,16 @@ public static class PasswordMapReader
         foreach (var cell in headerRow.CellsUsed())
         {
             var header = cell.GetString().Trim();
-            if (header.Equals("FileName", StringComparison.OrdinalIgnoreCase))
+            if (IsFileNameHeader(header))
                 fileNameCol = cell.Address.ColumnNumber;
-            else if (header.Equals("Password", StringComparison.OrdinalIgnoreCase))
+            else if (IsPasswordHeader(header))
                 passwordCol = cell.Address.ColumnNumber;
         }
 
         if (fileNameCol < 0 || passwordCol < 0)
             throw new InvalidOperationException(
-                "Excel file must contain 'FileName' and 'Password' columns.");
+                "Excel file must contain filename and password columns. Supported headers: " +
+                "'FileName' or 'Custom File Name (No Special Characters)', and 'Password' or 'Password (Optional)'.");
 
         var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
@@ -51,4 +52,14 @@ public static class PasswordMapReader
 
         return map;
     }
+
+    private static bool IsFileNameHeader(string header) =>
+        header.Equals("FileName", StringComparison.OrdinalIgnoreCase) ||
+        header.Equals(
+            "Custom File Name (No Special Characters)",
+            StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsPasswordHeader(string header) =>
+        header.Equals("Password", StringComparison.OrdinalIgnoreCase) ||
+        header.Equals("Password (Optional)", StringComparison.OrdinalIgnoreCase);
 }
